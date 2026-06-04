@@ -22,10 +22,11 @@ HTTP_PORT=$(prompt_default "Укажите порт для HTTP/HTTPS (по ум
 SOCKS_PORT=$(prompt_default "Укажите порт для SOCKS (по умолчанию 1080): " "1080")
 
 # ===== 2) цепочка (родительский прокси) =====
-echo
-read -p "Подключаться ли с другого прокси? (y/N): " USE_PARENT_CHOICE
-USE_PARENT_CHOICE=${USE_PARENT_CHOICE,,}  # lower
+#echo
+#read -p "Подключаться ли с другого прокси? (y/N): " USE_PARENT_CHOICE
+#USE_PARENT_CHOICE=${USE_PARENT_CHOICE,,}  # lower
 
+USE_PARENT_CHOICE="no"
 USE_PARENT="no"
 PARENT_BLOCK=""
 if [[ "$USE_PARENT_CHOICE" == "y" || "$USE_PARENT_CHOICE" == "yes" ]]; then
