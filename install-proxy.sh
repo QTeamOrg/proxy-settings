@@ -4,15 +4,15 @@ set -euo pipefail
 # ===== helpers =====
 prompt_default() {
   local prompt="$1" default="$2" var
-  read -p "$prompt" var || true
-  echo "${var:-$default}"
+  read -r -p "$prompt" var < /dev/tty || true
+  printf '%s' "${var:-$default}"
 }
 
 prompt_secret() {
   local prompt="$1" var
-  read -s -p "$prompt" var || true
-  echo
-  echo "$var"
+  read -r -s -p "$prompt" var < /dev/tty || true
+  printf '\n' > /dev/tty
+  printf '%s' "$var"
 }
 
 # ===== 1) базовые параметры =====
