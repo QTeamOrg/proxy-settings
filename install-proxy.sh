@@ -1,142 +1,248 @@
 #!/bin/bash
 set -euo pipefail
 
-# ===== helpers =====
+SUDO=""
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  SUDO="sudo"
+fi
+
+require_tty() {
+  if [[ ! -r /dev/tty ]]; then
+    echo "This script requires an interactive terminal."
+    exit 1
+  fi
+}
+
+prompt() {
+  local text="$1" value
+  read -r -p "$text" value < /dev/tty
+  printf '%s' "$value"
+}
+
 prompt_default() {
-  local prompt="$1" default="$2" var
-  read -r -p "$prompt" var < /dev/tty || true
-  printf '%s' "${var:-$default}"
+  local text="$1" default="$2" value
+  read -r -p "$text" value < /dev/tty
+  printf '%s' "${value:-$default}"
 }
 
 prompt_secret() {
-  local prompt="$1" var
-  read -r -s -p "$prompt" var < /dev/tty || true
+  local text="$1" value
+  read -r -s -p "$text" value < /dev/tty
   printf '\n' > /dev/tty
-  printf '%s' "$var"
+  printf '%s' "$value"
 }
 
-# ===== 1) базовые параметры =====
-read -p "Укажите имя пользователя: " PROXY_USER
-PROXY_PASS=$(prompt_secret "Укажите пароль пользователя: ")
-HTTP_PORT=$(prompt_default "Укажите порт для HTTP/HTTPS (по умолчанию 3128): " "3128")
-SOCKS_PORT=$(prompt_default "Укажите порт для SOCKS (по умолчанию 1080): " "1080")
+to_lower() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
 
-# ===== 2) цепочка (родительский прокси) =====
-#echo
-#read -p "Подключаться ли с другого прокси? (y/N): " USE_PARENT_CHOICE
-#USE_PARENT_CHOICE=${USE_PARENT_CHOICE,,}  # lower
+is_valid_port() {
+  local port="$1"
+  [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 ))
+}
 
-USE_PARENT_CHOICE="no"
+is_valid_username() {
+  local value="$1"
+  [[ "$value" =~ ^[a-zA-Z0-9_.-]+$ ]]
+}
+
+is_valid_password() {
+  local value="$1"
+  [[ "$value" =~ ^[a-zA-Z0-9_.@%+=,-]+$ ]]
+}
+
+is_valid_host() {
+  local value="$1"
+  [[ -n "$value" && ! "$value" =~ [[:space:]] ]]
+}
+
+prompt_username() {
+  local value
+
+  while true; do
+    value=$(prompt "Proxy username: ")
+
+    if is_valid_username "$value"; then
+      printf '%s' "$value"
+      return
+    fi
+
+    echo "Invalid username. Use only letters, digits, dot, underscore and dash." > /dev/tty
+  done
+}
+
+prompt_password() {
+  local value
+
+  while true; do
+    value=$(prompt_secret "Proxy password: ")
+
+    if is_valid_password "$value"; then
+      printf '%s' "$value"
+      return
+    fi
+
+    echo "Invalid password. Use only letters, digits and these symbols: . _ @ % + = , -" > /dev/tty
+  done
+}
+
+prompt_port() {
+  local text="$1" default="$2" value
+
+  while true; do
+    value=$(prompt_default "$text" "$default")
+
+    if is_valid_port "$value"; then
+      printf '%s' "$value"
+      return
+    fi
+
+    echo "Invalid port. Use a number from 1 to 65535." > /dev/tty
+  done
+}
+
+require_tty
+
+PROXY_USER=$(prompt_username)
+PROXY_PASS=$(prompt_password)
+HTTP_PORT=$(prompt_port "HTTP/HTTPS port [default 3128]: " "3128")
+SOCKS_PORT=$(prompt_port "SOCKS5 port [default 1080]: " "1080")
+
+while [[ "$HTTP_PORT" == "$SOCKS_PORT" ]]; do
+  echo "HTTP and SOCKS ports must be different." > /dev/tty
+  SOCKS_PORT=$(prompt_port "SOCKS5 port [default 1080]: " "1080")
+done
+
+USE_PARENT_CHOICE=$(prompt_default "Use upstream/parent proxy? (y/N): " "n")
+USE_PARENT_CHOICE=$(to_lower "$USE_PARENT_CHOICE")
+
 USE_PARENT="no"
 PARENT_BLOCK=""
+PARENT_TYPE=""
+PARENT_KIND=""
+PARENT_HOST=""
+PARENT_PORT=""
+PARENT_USER=""
+PARENT_PASS=""
+
 if [[ "$USE_PARENT_CHOICE" == "y" || "$USE_PARENT_CHOICE" == "yes" ]]; then
   USE_PARENT="yes"
-  echo "Типы: http, https (через CONNECT), socks5, socks4"
-  read -p "Тип родительского прокси [http/https/socks5/socks4] (по умолчанию http): " PARENT_TYPE
-  PARENT_TYPE=${PARENT_TYPE:-http}
-  PARENT_TYPE=${PARENT_TYPE,,}
 
-  read -p "Хост/IP родительского прокси: " PARENT_HOST
-  read -p "Порт родительского прокси: " PARENT_PORT
-  read -p "Логин к родительскому прокси (оставьте пустым, если нет): " PARENT_USER
+  while true; do
+    PARENT_TYPE=$(prompt_default "Parent proxy type [http/https/socks5/socks4] default http: " "http")
+    PARENT_TYPE=$(to_lower "$PARENT_TYPE")
+
+    case "$PARENT_TYPE" in
+      http|https)
+        PARENT_KIND="connect"
+        break
+        ;;
+      socks5)
+        PARENT_KIND="socks5"
+        break
+        ;;
+      socks4)
+        PARENT_KIND="socks4"
+        break
+        ;;
+      *)
+        echo "Invalid parent proxy type. Allowed: http, https, socks5, socks4." > /dev/tty
+        ;;
+    esac
+  done
+
+  while true; do
+    PARENT_HOST=$(prompt "Parent proxy host/IP: ")
+
+    if is_valid_host "$PARENT_HOST"; then
+      break
+    fi
+
+    echo "Invalid parent host/IP." > /dev/tty
+  done
+
+  PARENT_PORT=$(prompt_port "Parent proxy port: " "3128")
+
+  PARENT_USER=$(prompt "Parent proxy username, empty if none: ")
+
   if [[ -n "$PARENT_USER" ]]; then
-    PARENT_PASS=$(prompt_secret "Пароль к родительскому прокси: ")
+    if ! is_valid_username "$PARENT_USER"; then
+      echo "Invalid parent username. Use only letters, digits, dot, underscore and dash."
+      exit 1
+    fi
+
+    PARENT_PASS=$(prompt_secret "Parent proxy password: ")
+
+    if ! is_valid_password "$PARENT_PASS"; then
+      echo "Invalid parent password. Use only letters, digits and these symbols: . _ @ % + = , -"
+      exit 1
+    fi
+
+    PARENT_BLOCK="parent 1000 $PARENT_KIND $PARENT_HOST $PARENT_PORT $PARENT_USER $PARENT_PASS"
   else
-    PARENT_PASS=""
+    PARENT_BLOCK="parent 1000 $PARENT_KIND $PARENT_HOST $PARENT_PORT"
   fi
-
-  # 3proxy: parent <type> <maxfails> <host> <port> [user pass]
-  # maxfails=1 и trick 'deny direct' через proxyonly: используем таблицу родителя и запрещаем прямой выход
-  # Реализуем запрет «прямого» выхода с помощью ACL: всё, что не прошло через parent — запрещаем.
-  # Для 3proxy достаточно определить parent до сервисов — запросы пойдут через родителя.
-  # Для "https" используем тип http (CONNECT идет через http-прокси).
-  case "$PARENT_TYPE" in
-    https) PARENT_KIND="http" ;;
-    http|socks5|socks4) PARENT_KIND="$PARENT_TYPE" ;;
-    *) echo "Неверный тип '$PARENT_TYPE'. Допустимо: http/https/socks5/socks4"; exit 1 ;;
-  esac
-
-  if [[ -n "$PARENT_USER" ]]; then
-    PARENT_BLOCK="parent $PARENT_KIND 1 $PARENT_HOST $PARENT_PORT $PARENT_USER $PARENT_PASS
-"
-  else
-    PARENT_BLOCK="parent $PARENT_KIND 1 $PARENT_HOST $PARENT_PORT
-"
-  fi
-
-  # Чтобы гарантированно не было «прямого» выхода при падении родителя, добавим запрещающее правило via parent ACL:
-  # Используем internal ACL «!parent» запрещая прямые коннекты. В 3proxy это достигается правилом 'parent' + deny all после сервисов.
-  # Мы решим это проще: включим 'parent' и добавим 'deny * *' как fallback если родитель недоступен (см. ниже).
 fi
 
-# ===== 3) установка =====
-sudo apt update && sudo apt install -y git build-essential ufw curl libssl-dev
+export DEBIAN_FRONTEND=noninteractive
 
-if [[ ! -d 3proxy ]]; then
-  git clone https://github.com/z3APA3A/3proxy.git
+$SUDO apt update
+$SUDO apt install -y git build-essential ufw curl libssl-dev ca-certificates
+
+SRC_DIR="/usr/local/src/3proxy"
+
+$SUDO mkdir -p /usr/local/src
+
+if [[ -d "$SRC_DIR/.git" ]]; then
+  $SUDO git -C "$SRC_DIR" pull --ff-only
+else
+  $SUDO git clone https://github.com/z3APA3A/3proxy.git "$SRC_DIR"
 fi
-cd 3proxy
-make -f Makefile.Linux
 
-# бинарь
-sudo mkdir -p /etc/3proxy/logs
-sudo cp ./bin/3proxy /usr/local/bin/
+$SUDO make -C "$SRC_DIR" -f Makefile.Linux
+$SUDO install -m 0755 "$SRC_DIR/bin/3proxy" /usr/local/bin/3proxy
 
-# ===== 4) конфиг 3proxy =====
-# Базовый конфиг + users + сервисы; если USE_PARENT=yes — вставим блок parent и запретим прямой выход.
+$SUDO mkdir -p /etc/3proxy/logs
+
 CFG="/etc/3proxy/3proxy.cfg"
 
-# Формируем список nserver: локальные резолверы можно заменить при желании
-DNS1="8.8.8.8"
-DNS2="1.1.1.1"
-
-# Логи в дате/времени по одному файлу (D = daily)
-read -r -d '' BASE_CFG <<EOF || true
-nserver $DNS1
-nserver $DNS2
+if [[ "$USE_PARENT" == "yes" ]]; then
+  CONFIG_CONTENT=$(cat <<EOF
+nserver 8.8.8.8
+nserver 1.1.1.1
 nscache 65536
 timeouts 1 5 30 60 180 1800 15 60
-
-# Логирование
 log /etc/3proxy/logs/3proxy.log D
 logformat "L%Y-%m-%d %H:%M:%S %N.%p %E %U %C:%c %R:%r %O %I %h %T"
-
-# Аутентификация
 auth strong
 users $PROXY_USER:CL:$PROXY_PASS
 allow $PROXY_USER
-
+$PARENT_BLOCK
+socks -p$SOCKS_PORT
+proxy -p$HTTP_PORT
 EOF
-
-# Если используем родителя — добавим блок parent (до сервисов)
-if [[ "$USE_PARENT" == "yes" ]]; then
-  BASE_CFG+="$PARENT_BLOCK"
-  # Чтобы не было прямого выхода, используем строгую схему:
-  # - Сразу после сервисов ставим 'deny * *' если родитель не сработает.
-  # На практике 3proxy не пойдет напрямую при наличии parent.
-  DENY_DIRECT='deny * *'
+)
 else
-  DENY_DIRECT=''
+  CONFIG_CONTENT=$(cat <<EOF
+nserver 8.8.8.8
+nserver 1.1.1.1
+nscache 65536
+timeouts 1 5 30 60 180 1800 15 60
+log /etc/3proxy/logs/3proxy.log D
+logformat "L%Y-%m-%d %H:%M:%S %N.%p %E %U %C:%c %R:%r %O %I %h %T"
+auth strong
+users $PROXY_USER:CL:$PROXY_PASS
+allow $PROXY_USER
+socks -p$SOCKS_PORT
+proxy -p$HTTP_PORT
+EOF
+)
 fi
 
-# Сервисы
-read -r -d '' SRV_CFG <<EOF || true
+printf '%s\n' "$CONFIG_CONTENT" | $SUDO tee "$CFG" > /dev/null
+$SUDO chmod 600 "$CFG"
 
-
-# SOCKS5
-socks -p$SOCKS_PORT
-
-# HTTP/HTTPS прокси
-proxy -p$HTTP_PORT
-
-$DENY_DIRECT
-EOF
-
-# Пишем конфиг
-sudo tee "$CFG" > /dev/null <<< "${BASE_CFG}${SRV_CFG}"
-
-# ===== 5) systemd =====
-sudo tee /etc/systemd/system/3proxy.service > /dev/null <<'EOF'
+$SUDO tee /etc/systemd/system/3proxy.service > /dev/null <<'EOF'
 [Unit]
 Description=3proxy Proxy Server
 After=network.target
@@ -145,35 +251,40 @@ After=network.target
 ExecStart=/usr/local/bin/3proxy /etc/3proxy/3proxy.cfg
 Restart=always
 RestartSec=2
-
-# Можно добавить PrivateTmp=true и User/Group если заведёте отдельного пользователя
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# ===== 6) UFW =====
-sudo ufw allow ${SOCKS_PORT}/tcp
-sudo ufw allow ${HTTP_PORT}/tcp
-sudo ufw allow 'OpenSSH'
-sudo ufw --force enable
-sudo ufw reload
+$SUDO ufw allow "$SOCKS_PORT/tcp"
+$SUDO ufw allow "$HTTP_PORT/tcp"
+$SUDO ufw allow OpenSSH || true
 
-# ===== 7) запуск =====
-sudo systemctl daemon-reexec
-sudo systemctl enable 3proxy
-sudo systemctl restart 3proxy
+if [[ -n "${SSH_CONNECTION:-}" ]]; then
+  SSH_PORT=$(printf '%s\n' "$SSH_CONNECTION" | awk '{print $4}')
 
-# ===== 8) вывод =====
-SERVER_IP=$(curl -s https://api.ipify.org || echo "YOUR_SERVER_IP")
+  if is_valid_port "$SSH_PORT"; then
+    $SUDO ufw allow "$SSH_PORT/tcp" || true
+  fi
+fi
+
+$SUDO ufw --force enable
+$SUDO ufw reload
+
+$SUDO systemctl daemon-reload
+$SUDO systemctl enable 3proxy
+$SUDO systemctl restart 3proxy
+
+SERVER_IP=$(curl -fsS --connect-timeout 10 --noproxy '*' https://api.ipify.org || echo "YOUR_SERVER_IP")
 
 echo
-echo "✓ Установка завершена. Данные прокси:"
+echo "Installation completed."
 echo
 echo "HTTP:"
 echo "${SERVER_IP}:${HTTP_PORT}:${PROXY_USER}:${PROXY_PASS}:http"
 echo
-echo "HTTPS:"
+echo "HTTPS via HTTP CONNECT:"
 echo "${SERVER_IP}:${HTTP_PORT}:${PROXY_USER}:${PROXY_PASS}:https"
 echo
 echo "SOCKS5:"
@@ -181,12 +292,25 @@ echo "${SERVER_IP}:${SOCKS_PORT}:${PROXY_USER}:${PROXY_PASS}:socks5"
 echo
 
 if [[ "$USE_PARENT" == "yes" ]]; then
-  echo "Цепочка активна. Все запросы проходят через родительский прокси:"
-  echo "- Тип: ${PARENT_TYPE}"
-  echo "- Адрес: ${PARENT_HOST}:${PARENT_PORT}"
+  echo "Parent proxy chain is enabled:"
+  echo "Type: $PARENT_TYPE"
+  echo "3proxy parent type: $PARENT_KIND"
+  echo "Address: $PARENT_HOST:$PARENT_PORT"
+
   if [[ -n "$PARENT_USER" ]]; then
-    echo "- Аутентификация к родителю: ${PARENT_USER}/********"
+    echo "Parent auth: $PARENT_USER/********"
   else
-    echo "- Аутентификация к родителю: нет"
+    echo "Parent auth: none"
   fi
+
+  echo
 fi
+
+echo "Check service:"
+echo "sudo systemctl status 3proxy --no-pager"
+echo
+echo "Test HTTP:"
+echo "curl -x http://${PROXY_USER}:${PROXY_PASS}@${SERVER_IP}:${HTTP_PORT} https://api.ipify.org"
+echo
+echo "Test SOCKS5:"
+echo "curl -x socks5h://${PROXY_USER}:${PROXY_PASS}@${SERVER_IP}:${SOCKS_PORT} https://api.ipify.org"
